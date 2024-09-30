@@ -120,6 +120,18 @@ impl MatrixLayout {
         }
         Ok(())
     }
+
+    fn set_row_major(&self) -> Result<(), CublasError> {
+        unsafe {
+            let layout = sys::cublasLtOrder_t::CUBLASLT_ORDER_ROW;
+            set_matrix_layout_attribute(
+                self.handle,
+                sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_ORDER,
+                (&layout) as *const _ as *const _,
+                mem::size_of::<sys::cublasLtOrder_t>(),
+            )
+        }
+    }
 }
 
 impl Drop for MatrixLayout {
@@ -285,11 +297,21 @@ pub trait MatmulShared {
     fn stream(&self) -> &CUstream;
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MatrixDataLayout {
+    RowMajor,
+    ColMajor,
+}
+
 /// Configuration for [Matmul]
 #[derive(Debug, Copy, Clone)]
 pub struct MatmulConfig {
     pub transa: bool,
     pub transb: bool,
+    pub transc: bool,
+    pub layout_a: MatrixDataLayout,
+    pub layout_b: MatrixDataLayout,
+    pub layout_c: MatrixDataLayout,
     pub m: u64,
     pub n: u64,
     pub k: u64,
@@ -339,10 +361,19 @@ pub trait Matmul<T>: MatmulShared {
             (cfg.k, cfg.n)
         };
 
+        let (c_rows, c_cols) = if cfg.transc {
+            (cfg.n, cfg.m)
+        } else {
+            (cfg.m, cfg.n)
+        };
+
         // Creates matrix layouts
         let a_layout = MatrixLayout::new(Self::matrix_type(), a_rows, a_cols, cfg.lda)?;
         if let (Some(batch_size), Some(stride_a)) = (cfg.batch_size, cfg.stride_a) {
             a_layout.set_batch(batch_size, stride_a)?;
+        }
+        if cfg.layout_a == MatrixDataLayout::RowMajor {
+            a_layout.set_row_major()?;
         }
 
         let b_layout = MatrixLayout::new(Self::matrix_type(), b_rows, b_cols, cfg.ldb)?;
@@ -350,11 +381,18 @@ pub trait Matmul<T>: MatmulShared {
             b_layout.set_batch(batch_size, stride_b)?;
         }
 
-        let c_layout = MatrixLayout::new(Self::matrix_type(), cfg.m, cfg.n, cfg.ldc)?;
+        if cfg.layout_b == MatrixDataLayout::RowMajor {
+            b_layout.set_row_major()?;
+        }
+
+        let c_layout = MatrixLayout::new(Self::matrix_type(), c_rows, c_cols, cfg.ldc)?;
         if let (Some(batch_size), Some(stride_c)) = (cfg.batch_size, cfg.stride_c) {
             c_layout.set_batch(batch_size, stride_c)?;
         }
 
+        if cfg.layout_c == MatrixDataLayout::RowMajor {
+            c_layout.set_row_major()?;
+        }
         // Matmul description
         let matmul_desc = MatmulDesc::new(Self::compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
 
@@ -534,6 +572,10 @@ mod tests {
                 MatmulConfig {
                     transa: false,
                     transb: false,
+                    transc: false,
+                    layout_a: MatrixDataLayout::ColMajor,
+                    layout_b: MatrixDataLayout::ColMajor,
+                    layout_c: MatrixDataLayout::ColMajor,
                     m: N as u64,
                     n: M as u64,
                     k: K as u64,
